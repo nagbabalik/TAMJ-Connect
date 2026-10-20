@@ -1,0 +1,292 @@
+name: Build TAMJ Slipstream (16 KB)
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-slipstream-16kb.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            triple: aarch64-linux-android
+          - abi: x86_64
+            triple: x86_64-linux-android
+    steps:
+      - name: Install compilers
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake ninja-build git curl perl make pkg-config binutils python3
+          "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.2.12479018"
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${{ matrix.triple }}"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/27.2.12479018" >> "${GITHUB_ENV}"
+          echo "SLIPSTREAM_BUILD_ROOT=${RUNNER_TEMP}/slipstream-build" >> "${GITHUB_ENV}"
+
+      - name: Download pinned Slipstream and OpenSSL sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${SLIPSTREAM_BUILD_ROOT}/openssl-src"
+          git clone https://github.com/noahclanman/slipstream-rust.git "${SLIPSTREAM_BUILD_ROOT}/slipstream-rust"
+          git -C "${SLIPSTREAM_BUILD_ROOT}/slipstream-rust" checkout 7de506b
+          git -C "${SLIPSTREAM_BUILD_ROOT}/slipstream-rust" submodule update --init --recursive
+          git clone --depth 1 --branch openssl-3.0.15 https://github.com/openssl/openssl.git "${SLIPSTREAM_BUILD_ROOT}/openssl-src/openssl-3.0.15"
+
+      - name: Build Android Slipstream with 16 KB ELF alignment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-scripts
+          cat > build-scripts/build-openssl.sh <<'TAMJ_SCRIPT_EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          
+          NDK="${ANDROID_NDK_HOME:-$HOME/ndk/android-ndk-r27c}"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          export PATH="$TOOLCHAIN/bin:$PATH"
+          
+          WORKSPACE="${SLIPSTREAM_BUILD_ROOT:-$HOME/slipstream-build}"
+          SRC="$WORKSPACE/openssl-src/openssl-3.0.15"
+          OUTROOT="$WORKSPACE/openssl-android"
+          API=24
+          
+          build_abi() {
+            abi="$1"
+            case "$abi" in
+              arm64-v8a)   target=android-arm64;  triple=aarch64-linux-android ;;
+              armeabi-v7a) target=android-arm;    triple=armv7a-linux-androideabi ;;
+              x86)         target=android-x86;    triple=i686-linux-android ;;
+              x86_64)      target=android-x86_64; triple=x86_64-linux-android ;;
+              *) echo "unknown abi $abi" >&2; exit 1 ;;
+            esac
+          
+            out="$OUTROOT/$abi"
+            echo "=== Building OpenSSL for $abi ($target) ==="
+            cd "$SRC"
+            make clean >/dev/null 2>&1 || true
+            rm -f Makefile configdata.pm
+            export ANDROID_NDK_ROOT="$NDK"
+            export ANDROID_NDK_HOME="$NDK"
+            export CC="${triple}${API}-clang"
+            export AR="llvm-ar"
+            export RANLIB="llvm-ranlib"
+            export CFLAGS="-fPIC"
+            ./Configure "$target" \
+              --prefix="$out" --openssldir="$out/ssl" \
+              no-shared no-tests no-ui-console no-asm \
+              -D__ANDROID_API__=$API >/dev/null
+            make -j"$(nproc)" build_libs >"$out.log" 2>&1 || { echo "OpenSSL build failed for $abi"; tail -40 "$out.log"; exit 1; }
+            make install_dev >/dev/null 2>&1
+            make install_sw >/dev/null 2>&1 || true
+            echo "--- installed $abi ---"
+            ls "$out/lib" 2>/dev/null | head
+            echo "--- include ---"
+            ls "$out/include/openssl/opensslv.h" 2>/dev/null
+          }
+          
+          mkdir -p "$OUTROOT"
+          for abi in "$@"; do
+            build_abi "$abi"
+          done
+          echo "DONE_OPENSSL"
+          TAMJ_SCRIPT_EOF
+          cat > build-scripts/build-picoquic.sh <<'TAMJ_SCRIPT_EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          
+          NDK="${ANDROID_NDK_HOME:-$HOME/ndk/android-ndk-r27c}"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          export PATH="$TOOLCHAIN/bin:$PATH"
+          
+          WORKSPACE="${SLIPSTREAM_BUILD_ROOT:-$HOME/slipstream-build}"
+          SRC="$WORKSPACE/slipstream-rust/vendor/picoquic"
+          OPENSSL_ROOT="$WORKSPACE/openssl-android"
+          BUILDROOT="$WORKSPACE/picoquic-android"
+          API=24
+          
+          build_abi() {
+            abi="$1"
+            case "$abi" in
+              arm64-v8a)   andabi=arm64-v8a ;;
+              armeabi-v7a) andabi=armeabi-v7a ;;
+              x86)         andabi=x86 ;;
+              x86_64)      andabi=x86_64 ;;
+              *) echo "unknown abi $abi" >&2; exit 1 ;;
+            esac
+            ssl="$OPENSSL_ROOT/$andabi"
+            bdir="$BUILDROOT/$andabi"
+          
+            echo "=== picoquic $andabi ==="
+            rm -rf "$bdir"
+            cmake -S "$SRC" -B "$bdir" \
+              -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI="$andabi" \
+              -DANDROID_PLATFORM="android-$API" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+              -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+              -DPICOQUIC_FETCH_PTLS=ON \
+              -DPTLS_WITH_FUSION=OFF \
+              -DWITH_FUSION=OFF \
+              -DBUILD_DEMO=OFF \
+              -DBUILD_HTTP=OFF \
+              -DBUILD_LOGLIB=OFF \
+              -DBUILD_LOGREADER=OFF \
+              -Dpicoquic_BUILD_TESTS=OFF \
+              -DOPENSSL_ROOT_DIR="$ssl" \
+              -DOPENSSL_INCLUDE_DIR="$ssl/include" \
+              -DOPENSSL_CRYPTO_LIBRARY="$ssl/lib/libcrypto.a" \
+              -DOPENSSL_SSL_LIBRARY="$ssl/lib/libssl.a" \
+              -DOPENSSL_USE_STATIC_LIBS=TRUE \
+              >"$bdir.configure.log" 2>&1 || { echo "configure failed"; tail -40 "$bdir.configure.log"; exit 1; }
+          
+            cmake --build "$bdir" --target picoquic-core -j"$(nproc)" >"$bdir.build.log" 2>&1 \
+              || { echo "build failed"; tail -50 "$bdir.build.log"; exit 1; }
+          
+            echo "--- libs for $andabi ---"
+            find "$bdir" -name '*.a' | head -20
+          }
+          
+          mkdir -p "$BUILDROOT"
+          for abi in "$@"; do
+            build_abi "$abi"
+          done
+          echo "DONE_PICOQUIC"
+          TAMJ_SCRIPT_EOF
+          cat > build-scripts/build-rust.sh <<'TAMJ_SCRIPT_EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          
+          NDK="${ANDROID_NDK_HOME:-$HOME/ndk/android-ndk-r27c}"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          export PATH="$TOOLCHAIN/bin:$HOME/.cargo/bin:$PATH"
+          
+          WORKSPACE="${SLIPSTREAM_BUILD_ROOT:-$HOME/slipstream-build}"
+          export CARGO_TARGET_DIR="$WORKSPACE/cargo-target"
+          
+          SRC="$WORKSPACE/slipstream-rust"
+          OPENSSL_ROOT="$WORKSPACE/openssl-android"
+          PICOQUIC_ROOT="$WORKSPACE/picoquic-android"
+          API=24
+          
+          build_abi() {
+            abi="$1"
+            case "$abi" in
+              arm64-v8a)   triple=aarch64-linux-android;      cc=aarch64-linux-android${API}-clang;   ar=llvm-ar; pabi=arm64-v8a; builtins_arch=aarch64 ;;
+              armeabi-v7a) triple=armv7-linux-androideabi;    cc=armv7a-linux-androideabi${API}-clang; ar=llvm-ar; pabi=armeabi-v7a; builtins_arch=arm ;;
+              x86)         triple=i686-linux-android;         cc=i686-linux-android${API}-clang;      ar=llvm-ar; pabi=x86; builtins_arch=i686 ;;
+              x86_64)      triple=x86_64-linux-android;       cc=x86_64-linux-android${API}-clang;    ar=llvm-ar; pabi=x86_64; builtins_arch=x86_64 ;;
+              *) echo "unknown abi $abi" >&2; exit 1 ;;
+            esac
+          
+            ssl="$OPENSSL_ROOT/$pabi"
+            pq="$PICOQUIC_ROOT/$pabi"
+            pqtls="$pq/_deps/picotls-src"
+          
+            echo "=== slipstream-client $abi ($triple) ==="
+            cd "$SRC"
+            export TARGET="$triple"
+            # NDK r27 needs explicit 16 KiB ELF LOAD-segment alignment on arm64/x86_64.
+            # Rebuilding is required; changing an already compiled .so cannot fix its alignment.
+            export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
+            export CC_${triple//-/_}="$cc"
+            export AR_${triple//-/_}="$ar"
+            export CARGO_TARGET_$(echo "$triple" | tr 'a-z-' 'A-Z_')_LINKER="$cc"
+            export PICOQUIC_INCLUDE_DIR="$SRC/vendor/picoquic/picoquic"
+            export PICOQUIC_LIB_DIR="$pq"
+            export PICOTLS_INCLUDE_DIR="$pqtls/include"
+            export OPENSSL_INCLUDE_DIR="$ssl/include"
+            export OPENSSL_SSL_LIBRARY="$ssl/lib/libssl.a"
+            export OPENSSL_CRYPTO_LIBRARY="$ssl/lib/libcrypto.a"
+            export OPENSSL_USE_STATIC_LIBS=TRUE
+            export OPENSSL_STATIC=1
+            export OPENSSL_DIR="$ssl"
+            export OPENSSL_NO_VENDOR=1
+            export PKG_CONFIG_ALLOW_CROSS=1
+            export PICOQUIC_AUTO_BUILD=0
+            # Ensure clang_rt builtins are discoverable by build.rs
+            export RUST_ANDROID_GRADLE_CC="$cc"
+            export RUST_ANDROID_GRADLE_AR="$ar"
+          
+            cargo build -p slipstream-client --release --target "$triple" \
+              --features openssl-static 2>&1 | tail -30
+            echo "--- artifact ---"
+            ls -la "$CARGO_TARGET_DIR/$triple/release/slipstream-client"
+          }
+          
+          build_abi "$1"
+          echo "DONE_RUST"
+          TAMJ_SCRIPT_EOF
+          bash build-scripts/build-openssl.sh "${{ matrix.abi }}"
+          bash build-scripts/build-picoquic.sh "${{ matrix.abi }}"
+          bash build-scripts/build-rust.sh "${{ matrix.abi }}"
+          mkdir -p native-output
+          cp "${SLIPSTREAM_BUILD_ROOT}/cargo-target/${{ matrix.triple }}/release/slipstream-client" native-output/libslipstream_client.so
+
+      - name: Verify ELF page alignment and package result
+        shell: bash
+        run: |
+          set -euo pipefail
+          readelf -lW native-output/libslipstream_client.so | grep LOAD
+          python3 - <<'TAMJ_VERIFY_EOF'
+          import struct
+          from pathlib import Path
+          path=Path("native-output/libslipstream_client.so")
+          data=path.read_bytes()
+          assert len(data)>=64 and data[:4]==b"\x7fELF" and data[4]==2, "Not ELF64"
+          endian="<" if data[5]==1 else ">"
+          phoff=struct.unpack_from(endian+"Q",data,32)[0]
+          entsize,count=struct.unpack_from(endian+"HH",data,54)
+          assert entsize>=56 and count>0
+          loads=0
+          for i in range(count):
+              off=phoff+i*entsize
+              assert off+56<=len(data), "Truncated ELF header"
+              typ,_,offset,vaddr,_,_,_,align=struct.unpack_from(endian+"IIQQQQQQ",data,off)
+              if typ==1:
+                  loads+=1
+                  assert align>=16384 and (offset-vaddr)%16384==0, f"Bad alignment: {i} {align}"
+          assert loads>0
+          print("PASS: 16 KB PT_LOAD alignment", loads)
+          TAMJ_VERIFY_EOF
+
+      - name: Upload verified native artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: slipstream-${{ matrix.abi }}-16kb
+          path: native-output/libslipstream_client.so
+          if-no-files-found: error
+          retention-days: 14
+
+  package:
+    name: Combine both architectures
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: slipstream-arm64-v8a-16kb
+          path: jniLibs/arm64-v8a
+      - uses: actions/download-artifact@v4
+        with:
+          name: slipstream-x86_64-16kb
+          path: jniLibs/x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TAMJ-verified-16KB-jniLibs
+          path: jniLibs/
+          if-no-files-found: error
+          retention-days: 14
